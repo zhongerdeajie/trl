@@ -15,7 +15,7 @@
 import pytest
 import torch
 from datasets import Dataset, DatasetDict
-from transformers import TrainerCallback
+from transformers import AutoModelForCausalLM, AutoTokenizer, TrainerCallback
 from transformers.utils import is_peft_available
 
 from trl.experimental.sdft import SDFTConfig, SDFTTrainer
@@ -546,3 +546,29 @@ class TestSDFTTrainer(TrlTestCase):
         assert pad_token_id is not None
         assert trainer.model.config.pad_token_id == pad_token_id
         assert trainer.model.generation_config.pad_token_id == pad_token_id
+
+    def test_teacher_model_like_model_instance(self):
+        # A policy passed as an instance has no `model_init_kwargs`: the teacher is built with its dtype and attention
+        # https://github.com/huggingface/trl/issues/7618
+        dataset = Dataset.from_dict(
+            {
+                "prompt": ["Solve 2+2.", "Name the capital of France."],
+                "privileged_context": ["Example answer: 4.", "Example answer: Paris."],
+            }
+        )
+        model = AutoModelForCausalLM.from_pretrained(
+            "trl-internal-testing/tiny-Qwen2ForCausalLM-2.5", dtype=torch.bfloat16, attn_implementation="eager"
+        )
+        tokenizer = AutoTokenizer.from_pretrained("trl-internal-testing/tiny-Qwen2ForCausalLM-2.5")
+        training_args = SDFTConfig(
+            output_dir=self.tmp_dir,
+            report_to="none",
+            use_cpu=True,
+            per_device_train_batch_size=1,
+            max_completion_length=8,
+            num_generations=1,
+        )
+        trainer = SDFTTrainer(model=model, args=training_args, train_dataset=dataset, processing_class=tokenizer)
+
+        assert trainer.teacher_model.dtype == torch.bfloat16
+        assert trainer.teacher_model.config._attn_implementation == "eager"

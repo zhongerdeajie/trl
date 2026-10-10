@@ -17,7 +17,7 @@ import logging
 import pytest
 import torch
 from datasets import Dataset, DatasetDict, load_dataset
-from transformers import HfArgumentParser, TrainerCallback
+from transformers import AutoModelForCausalLM, HfArgumentParser, TrainerCallback
 
 from trl.experimental.sdpo import SDPOConfig, SDPOTrainer
 
@@ -612,3 +612,29 @@ class TestSDPOTrainer(TrlTestCase):
         assert pad_token_id is not None
         assert trainer.model.config.pad_token_id == pad_token_id
         assert trainer.model.generation_config.pad_token_id == pad_token_id
+
+    def test_teacher_model_like_model_instance(self):
+        # A policy passed as an instance has no `model_init_kwargs`: the teacher is built with its dtype and attention
+        # https://github.com/huggingface/trl/issues/7618
+        dataset = Dataset.from_dict({"prompt": ["Solve 2+2.", "Name the capital of France."]})
+        model = AutoModelForCausalLM.from_pretrained(
+            "trl-internal-testing/tiny-Qwen2ForCausalLM-2.5", dtype=torch.bfloat16, attn_implementation="eager"
+        )
+        training_args = SDPOConfig(
+            output_dir=self.tmp_dir,
+            report_to="none",
+            use_cpu=True,
+            per_device_train_batch_size=1,
+            num_generations=1,
+            max_completion_length=8,
+            teacher_model_kind="base",
+        )
+        trainer = SDPOTrainer(
+            model=model,
+            reward_funcs=lambda **kwargs: [0.0] * len(kwargs["prompts"]),
+            args=training_args,
+            train_dataset=dataset,
+        )
+
+        assert trainer.teacher_model.dtype == torch.bfloat16
+        assert trainer.teacher_model.config._attn_implementation == "eager"
