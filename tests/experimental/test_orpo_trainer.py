@@ -14,10 +14,12 @@
 
 import pytest
 import torch
+import torch.nn.functional as F
 from datasets import DatasetDict, load_dataset
 from transformers import AutoModelForCausalLM, AutoModelForSeq2SeqLM, AutoTokenizer
 
 from trl.experimental.orpo import ORPOConfig, ORPOTrainer
+from trl.experimental.orpo.orpo_trainer import log1mexp
 
 from ..testing_utils import TrlTestCase, require_peft
 
@@ -298,3 +300,48 @@ class TestORPOTrainer(TrlTestCase):
         trainer.train()
 
         assert trainer.state.log_history[-2]["eval_test"] == 0.0
+
+
+class TestLog1mexp(TrlTestCase):
+    # Split point of `log1mexp`, -log(2)
+    T = -0.6931471805599453
+
+    def reference(self, x):
+        """Float64 reference of `log1mexp`, free of the NaN-gradient issue under test."""
+        x = x.to(torch.float64)
+        return torch.where(x < self.T, torch.log1p(-torch.exp(x)), torch.log(-torch.expm1(x)))
+
+    def test_values_match_float64_reference(self):
+        x = torch.tensor([-100.0, -20.0, -5.0, self.T, -0.1, -1e-3, -1e-6, -1e-8], dtype=torch.float32)
+        torch.testing.assert_close(log1mexp(x), self.reference(x).to(torch.float32), rtol=1e-5, atol=1e-6)
+
+    def test_gradient_near_zero_is_finite(self):
+        # Regression test for https://github.com/huggingface/trl/issues/7608: for strictly negative fp32
+        # log-probabilities close to zero, the forward value is finite but the gradient used to be NaN because
+        # `torch.where` also backpropagates through the singular unselected `log1p(-exp(x))` branch.
+        x = torch.tensor([-1e-8], dtype=torch.float32, requires_grad=True)
+        log1mexp(x).backward()
+        assert torch.isfinite(x.grad).all()
+        x64 = x.detach().to(torch.float64)
+        torch.testing.assert_close(x.grad.to(torch.float64), -torch.exp(x64) / (1 - torch.exp(x64)), rtol=1e-5, atol=0)
+
+    def test_orpo_loss_gradient_is_finite_for_confident_model(self):
+        # Averaged token log-probabilities of a confident model can reach the affected range while the loss stays
+        # finite, so NaN parameter gradients would go unnoticed without this check.
+        head = torch.nn.Linear(2, 2, bias=False)
+        with torch.no_grad():
+            head.weight.copy_(torch.eye(2))
+
+        inputs = torch.zeros(2, 64, 2)
+        inputs[..., 0] = 20
+        inputs[0, 0, 0] = 14
+        inputs[1, 0, 0] = 13.5
+        logps = head(inputs).log_softmax(-1)[..., 0].mean(-1)
+        chosen_logps, rejected_logps = logps.unbind()
+
+        # Same odds-ratio term as `ORPOTrainer.odds_ratio_loss` for one preference pair.
+        log_odds = (chosen_logps - rejected_logps) - (log1mexp(chosen_logps) - log1mexp(rejected_logps))
+        loss = -chosen_logps - 0.1 * F.logsigmoid(log_odds)
+        loss.backward()
+
+        assert torch.isfinite(head.weight.grad).all()
